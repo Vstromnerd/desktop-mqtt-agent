@@ -4,6 +4,19 @@ A small Python agent that publishes the status of a Windows PC to [Home Assistan
 
 It is meant to be light and easy to read: one Python file, one config file, one installer.
 
+## Use cases
+
+The agent turns your PC into presence and control signals for Home Assistant automations. Some examples:
+
+- **Office lights that follow the PC.** Fade the lights out when every PC in the room is locked or off, and turn them back on when someone unlocks, with no motion sensor needed. Unlike a motion sensor, the *Locked* sensor doesn't switch off while you sit still watching a film or reading.
+- **Presence per room or person.** *In use* and *Locked* tell you someone is actually at their desk, which helps presence detection that would otherwise rely on phones or motion alone.
+- **Leaving home.** Lock every PC as part of a "leaving home" or alarm automation, and send any PC that's still idle to sleep after a while.
+- **Bedtime and night routines.** Put PCs that have been idle for a while to sleep when the house goes into night mode, or get a notification when one is still being used.
+- **Wake and power control.** Combine with Home Assistant's Wake-on-LAN integration and an NFC tag or button: one scan turns the PC on, and the same tag shuts it down when it's running.
+- **Focus and gaming scenes.** Use *Active app* to switch the room to a gaming or movie scene when a specific program is in the foreground, and back when you're done.
+- **Maintenance alerts.** Get notified when drive C: is almost full, or, with LibreHardwareMonitor, when the CPU or GPU stays hot for too long.
+- **Dashboards.** Show at a glance which PCs are on, locked or in use, with lock and power buttons right on the dashboard.
+
 ## What you get
 
 | Entity | What it shows |
