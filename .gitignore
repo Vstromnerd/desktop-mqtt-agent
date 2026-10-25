@@ -1,0 +1,9 @@
+# Local settings and logs: never commit these
+config.ini
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
