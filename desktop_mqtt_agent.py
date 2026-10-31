@@ -1,5 +1,5 @@
 """
-Desktop MQTT Agent - publishes the status of a Windows PC to Home Assistant over MQTT.
+Desktop MQTT Agent - publishes the status of a Windows or Linux PC to Home Assistant over MQTT.
 
 Entities appear in Home Assistant automatically through MQTT discovery
 (one device with sensors, binary sensors and buttons).
@@ -10,12 +10,15 @@ Usage:
 """
 
 import argparse
+import glob
+import os
 import configparser
 import ctypes
 import json
 import logging
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -28,9 +31,10 @@ import psutil
 
 APP_NAME = "Desktop MQTT Agent"
 APP_SLUG = "desktop_mqtt_agent"
-VERSION = "1.2.0"
+VERSION = "1.3.1"
 BASE_DIR = Path(__file__).resolve().parent
 IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
 
 # Identifiers from before the rename. They stay as they are, so existing
 # installations keep their Home Assistant device and their stored password.
@@ -49,7 +53,8 @@ NAMES = {
         "lock_btn": "Lock", "sleep_btn": "Sleep", "shutdown_btn": "Shut down",
         "restart_btn": "Restart",
         "cpu_temp": "CPU temperature", "gpu_temp": "GPU temperature", "gpu_load": "GPU usage",
-        "model": "Windows PC",
+        "model": "Windows PC", "model_linux": "Linux PC",
+        "disk_linux": "System disk usage",
         "shutdown_msg": "Shut down from Home Assistant",
         "restart_msg": "Restarted from Home Assistant",
     },
@@ -60,7 +65,8 @@ NAMES = {
         "lock_btn": "Vergrendelen", "sleep_btn": "Slaapstand", "shutdown_btn": "Afsluiten",
         "restart_btn": "Herstarten",
         "cpu_temp": "CPU-temperatuur", "gpu_temp": "GPU-temperatuur", "gpu_load": "GPU-gebruik",
-        "model": "Windows-pc",
+        "model": "Windows-pc", "model_linux": "Linux-pc",
+        "disk_linux": "Systeemschijf gebruik",
         "shutdown_msg": "Afgesloten via Home Assistant",
         "restart_msg": "Herstart via Home Assistant",
     },
@@ -89,6 +95,225 @@ def load_config(path: Path) -> configparser.ConfigParser:
 
 
 # --------------------------------------------------------------------------- #
+# Linux helpers (systemd-logind + the desktop's org.freedesktop.ScreenSaver)
+# --------------------------------------------------------------------------- #
+def _run(cmd, timeout=3):
+    """Run a command and return its stdout, or None when it fails."""
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def _linux_session():
+    """ID of the user's graphical login session (the one logind calls 'Display')."""
+    sid = _run(["loginctl", "show-user", str(os.getuid()), "-p", "Display", "--value"])
+    return sid or os.environ.get("XDG_SESSION_ID")
+
+
+def _linux_session_prop(prop):
+    sid = _linux_session()
+    if not sid:
+        return None
+    return _run(["loginctl", "show-session", sid, "-p", prop, "--value"])
+
+
+def _screensaver_call(method):
+    out = _run(["gdbus", "call", "--session", "--dest", "org.freedesktop.ScreenSaver",
+                "--object-path", "/org/freedesktop/ScreenSaver",
+                "--method", f"org.freedesktop.ScreenSaver.{method}"])
+    return out  # e.g. "(uint32 1234,)" or "(true,)"
+
+
+class WaylandIdleMonitor(threading.Thread):
+    """Tracks input idle time through the Wayland ext-idle-notify-v1 protocol.
+
+    KDE Plasma on Wayland doesn't answer GetSessionIdleTime and doesn't set
+    logind's IdleHint, but KWin does support this protocol. It is spoken here
+    directly over the Wayland socket (a few messages), so no extra package is needed.
+    The compositor reports "idled" after 1 second without input and "resumed" on
+    the next input; the idle time is counted from there.
+    """
+    TIMEOUT_MS = 1000
+
+    def __init__(self):
+        super().__init__(daemon=True, name="wayland-idle")
+        self.idle_since = None
+        self.working = False
+
+    def idle_seconds(self):
+        if not self.working:
+            return None
+        since = self.idle_since
+        return 0 if since is None else max(0, int(time.time() - since))
+
+    # ---- wire protocol --------------------------------------------------- #
+    @staticmethod
+    def _msg(obj, opcode, args=b""):
+        return struct.pack("=II", obj, ((8 + len(args)) << 16) | opcode) + args
+
+    @staticmethod
+    def _string(text):
+        data = text.encode() + b"\0"
+        return struct.pack("=I", len(data)) + data + b"\0" * (-len(data) % 4)
+
+    def _read_messages(self, sock, buf):
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("compositor closed the connection")
+        buf += chunk
+        msgs = []
+        while len(buf) >= 8:
+            obj, size_op = struct.unpack_from("=II", buf)
+            size = size_op >> 16
+            if size < 8 or len(buf) < size:
+                break
+            msgs.append((obj, size_op & 0xFFFF, buf[8:size]))
+            buf = buf[size:]
+        return msgs, buf
+
+    def _session(self):
+        runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        display = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+        path = display if display.startswith("/") else os.path.join(runtime, display)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        # wl_display(1).get_registry -> 2, then sync -> callback 3
+        sock.sendall(self._msg(1, 1, struct.pack("=I", 2)) + self._msg(1, 0, struct.pack("=I", 3)))
+        globals_, buf, synced = {}, b"", False
+        while not synced:
+            msgs, buf = self._read_messages(sock, buf)
+            for obj, op, body in msgs:
+                if obj == 2 and op == 0:  # wl_registry.global(name, interface, version)
+                    name, length = struct.unpack_from("=II", body)
+                    iface = body[8:8 + length - 1].decode()
+                    version = struct.unpack_from("=I", body, 8 + length + (-length % 4))[0]
+                    globals_[iface] = (name, version)
+                elif obj == 3 and op == 0:
+                    synced = True
+                elif obj == 1 and op == 0:
+                    raise ConnectionError("Wayland protocol error")
+        if "wl_seat" not in globals_ or "ext_idle_notifier_v1" not in globals_:
+            raise ConnectionError("compositor has no ext_idle_notifier_v1")
+        seat_name, _ = globals_["wl_seat"]
+        notifier_name, notifier_version = globals_["ext_idle_notifier_v1"]
+        notifier_version = min(notifier_version, 2)
+        bind = lambda name, iface, ver, new_id: self._msg(  # noqa: E731
+            2, 0, struct.pack("=I", name) + self._string(iface) + struct.pack("=II", ver, new_id))
+        # Version 2 can ignore idle inhibitors (video players), like Windows' input idle.
+        opcode = 2 if notifier_version >= 2 else 1
+        sock.sendall(bind(seat_name, "wl_seat", 1, 4)
+                     + bind(notifier_name, "ext_idle_notifier_v1", notifier_version, 5)
+                     + self._msg(5, opcode, struct.pack("=III", 6, self.TIMEOUT_MS, 4)))
+        self.working = True
+        self.idle_since = None
+        log.info("Idle time via Wayland ext-idle-notify (v%s)", notifier_version)
+        while True:
+            msgs, buf = self._read_messages(sock, buf)
+            for obj, op, _body in msgs:
+                if obj == 6 and op == 0:    # idled
+                    self.idle_since = time.time() - self.TIMEOUT_MS / 1000
+                elif obj == 6 and op == 1:  # resumed
+                    self.idle_since = None
+                elif obj == 1 and op == 0:
+                    raise ConnectionError("Wayland protocol error")
+
+    def run(self):
+        while True:
+            try:
+                self._session()
+            except Exception as exc:  # noqa: BLE001 - keep retrying, e.g. after re-login
+                if self.working:
+                    log.warning("Wayland idle monitor stopped (%s), retrying", exc)
+                else:
+                    log.debug("Wayland idle monitor not available: %s", exc)
+            self.working = False
+            time.sleep(30)
+
+
+_WAYLAND_IDLE = None
+
+
+def _linux_idle_seconds():
+    if _WAYLAND_IDLE is not None:
+        value = _WAYLAND_IDLE.idle_seconds()
+        if value is not None:
+            return value
+    out = _screensaver_call("GetSessionIdleTime")
+    if out:
+        match = re.search(r"(\d+)", out)
+        if match:
+            value = int(match.group(1))
+            # KDE Plasma reports milliseconds, the freedesktop spec says seconds.
+            if "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+                value //= 1000
+            return value
+    # Fallback: logind's idle hint (only set by some desktops).
+    if _linux_session_prop("IdleHint") == "yes":
+        since = _linux_session_prop("IdleSinceHint")  # microseconds since the epoch
+        if since and since.isdigit() and int(since) > 0:
+            return max(0, int(time.time() - int(since) / 1_000_000))
+    return None
+
+
+def _linux_locked():
+    hint = _linux_session_prop("LockedHint")
+    if hint in ("yes", "no"):
+        return hint == "yes"
+    out = _screensaver_call("GetActive")
+    if out:
+        return "true" in out
+    return None
+
+
+def _read_int(path):
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _linux_gpu_dir():
+    """sysfs folder of the dedicated GPU: the card with the most video memory."""
+    best, best_vram = None, -1
+    for dev in glob.glob("/sys/class/drm/card[0-9]*/device"):
+        if "-" in Path(dev).parent.name:  # skip connectors like card1-HDMI-A-1
+            continue
+        vram = _read_int(f"{dev}/mem_info_vram_total") or 0
+        if vram > best_vram:
+            best, best_vram = dev, vram
+    return best
+
+
+def read_linux_hw():
+    """CPU temperature, GPU temperature and GPU load straight from the kernel."""
+    result = {"cpu_temp": None, "gpu_temp": None, "gpu_load": None}
+    try:
+        temps = psutil.sensors_temperatures()
+    except (AttributeError, OSError):
+        temps = {}
+    for chip in ("k10temp", "zenpower", "coretemp"):
+        for entry in temps.get(chip, []):
+            if entry.label in ("Tctl", "Tdie", "Package id 0") or not entry.label:
+                result["cpu_temp"] = round(entry.current, 1)
+                break
+        if result["cpu_temp"] is not None:
+            break
+    gpu = _linux_gpu_dir()
+    if gpu:
+        load = _read_int(f"{gpu}/gpu_busy_percent")
+        if load is not None:
+            result["gpu_load"] = float(load)
+        for temp_file in sorted(glob.glob(f"{gpu}/hwmon/hwmon*/temp1_input")):
+            milli = _read_int(temp_file)
+            if milli is not None:
+                result["gpu_temp"] = round(milli / 1000, 1)
+                break
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Windows readings
 # --------------------------------------------------------------------------- #
 class _LastInputInfo(ctypes.Structure):
@@ -97,6 +322,8 @@ class _LastInputInfo(ctypes.Structure):
 
 def idle_seconds():
     """Seconds since the last mouse or keyboard input."""
+    if IS_LINUX:
+        return _linux_idle_seconds()
     if not IS_WINDOWS:
         return None
     lii = _LastInputInfo()
@@ -111,6 +338,8 @@ def idle_seconds():
 
 def is_locked():
     """Is the lock screen shown? (LogonUI.exe runs while it is.)"""
+    if IS_LINUX:
+        return _linux_locked()
     if not IS_WINDOWS:
         return None
     for proc in psutil.process_iter(["name"]):
@@ -120,7 +349,10 @@ def is_locked():
 
 
 def active_app():
-    """Process name of the foreground window (not the window title, for privacy)."""
+    """Process name of the foreground window (not the window title, for privacy).
+
+    Not available on Linux: Wayland deliberately hides other apps' windows.
+    """
     if not IS_WINDOWS:
         return None
     user32 = ctypes.windll.user32
@@ -136,11 +368,17 @@ def active_app():
 
 
 def system_drive_usage():
-    path = "C:\\" if IS_WINDOWS else "/"
-    try:
-        return round(psutil.disk_usage(path).percent, 1)
-    except OSError:
-        return None
+    if IS_WINDOWS:
+        paths = ["C:\\"]
+    else:
+        # On Fedora Atomic / Bazzite "/" is a read-only image; user data lives in /var.
+        paths = ["/var/home", "/var", "/"]
+    for path in paths:
+        try:
+            return round(psutil.disk_usage(path).percent, 1)
+        except OSError:
+            continue
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -190,6 +428,12 @@ class Agent:
         self.in_use_idle = cfg.getint("agent", "in_use_idle_minutes") * 60
         self.allow_power = cfg.getboolean("agent", "allow_power_commands")
         self.lhm_enabled = cfg.getboolean("lhm", "enabled")
+        # On Linux the kernel reports temperatures itself, no extra tool needed.
+        self.native_hw = IS_LINUX and any(v is not None for v in read_linux_hw().values())
+        if IS_LINUX:
+            global _WAYLAND_IDLE
+            _WAYLAND_IDLE = WaylandIdleMonitor()
+            _WAYLAND_IDLE.start()
 
         lang = cfg.get("device", "language").strip().lower()
         if lang not in NAMES:
@@ -240,6 +484,7 @@ class Agent:
             "ram": self._sensor("ram", unit_of_measurement="%",
                                 state_class="measurement", icon="mdi:memory"),
             "disk": self._sensor("disk", unit_of_measurement="%",
+                                 name=self.t["disk_linux"] if IS_LINUX else self.t["disk"],
                                  state_class="measurement", icon="mdi:harddisk",
                                  entity_category="diagnostic"),
             "idle": self._sensor("idle", unit_of_measurement="s",
@@ -267,7 +512,7 @@ class Agent:
             cmps["sleep_btn"] = self._button("sleep_btn", "sleep", "mdi:sleep")
             cmps["shutdown_btn"] = self._button("shutdown_btn", "shutdown", "mdi:power")
             cmps["restart_btn"] = self._button("restart_btn", "restart", "mdi:restart")
-        if self.lhm_enabled:
+        if self.lhm_enabled or self.native_hw:
             cmps["cpu_temp"] = self._sensor("cpu_temp", unit_of_measurement="°C",
                                             device_class="temperature",
                                             state_class="measurement")
@@ -280,7 +525,8 @@ class Agent:
         return {
             "dev": {"ids": [f"{LEGACY_DEVICE_PREFIX}{self.device_id}"],
                     "name": self.device_name,
-                    "mf": APP_NAME, "mdl": self.t["model"], "sw": VERSION},
+                    "mf": APP_NAME, "sw": VERSION,
+                    "mdl": self.t["model_linux"] if IS_LINUX else self.t["model"]},
             "o": {"name": APP_SLUG, "sw": VERSION},
             "availability_topic": self.avail_topic,
             "qos": 1,
@@ -288,6 +534,14 @@ class Agent:
         }
 
     # ---- state ----------------------------------------------------------- #
+    def _in_use(self, idle, locked):
+        if locked:
+            return False
+        if idle is None:
+            # Linux desktop without an idle reading: unlocked counts as in use.
+            return IS_LINUX
+        return idle < self.in_use_idle
+
     def collect_state(self):
         idle = idle_seconds()
         locked = is_locked()
@@ -299,9 +553,11 @@ class Agent:
             "boot": datetime.fromtimestamp(psutil.boot_time(), tz=timezone.utc).isoformat(),
             "app": active_app(),
             "locked": bool(locked),
-            "in_use": bool(idle is not None and idle < self.in_use_idle and not locked),
+            "in_use": self._in_use(idle, locked),
         }
-        if self.lhm_enabled:
+        if self.native_hw:
+            state.update(read_linux_hw())
+        elif self.lhm_enabled:
             state.update(read_lhm(self.cfg.get("lhm", "url"), {
                 "cpu_temp": self.cfg.get("lhm", "cpu_temp"),
                 "gpu_temp": self.cfg.get("lhm", "gpu_temp"),
@@ -319,12 +575,19 @@ class Agent:
     def handle_command(self, payload: str):
         log.info("Command received: %s", payload)
         if payload == "lock":
-            ctypes.windll.user32.LockWorkStation()
+            if IS_LINUX:
+                sid = _linux_session()
+                subprocess.Popen(["loginctl", "lock-session"] + ([sid] if sid else []))
+            else:
+                ctypes.windll.user32.LockWorkStation()
             return
         if not self.allow_power:
             log.warning("Power command '%s' refused (allow_power_commands = false)", payload)
             return
         delay = str(self.cfg.getint("agent", "shutdown_delay"))
+        if IS_LINUX:
+            self._handle_linux_power(payload, delay)
+            return
         if payload == "sleep":
             self._go_offline()
             # Note: with hibernation enabled, Windows hibernates instead of sleeping.
@@ -337,6 +600,18 @@ class Agent:
             subprocess.Popen(["shutdown", "/r", "/t", delay, "/c", self.t["restart_msg"]])
         else:
             log.warning("Unknown command: %s", payload)
+
+    def _handle_linux_power(self, payload, delay):
+        # logind lets the logged-in user do this without sudo.
+        actions = {"sleep": "suspend", "shutdown": "poweroff", "restart": "reboot"}
+        if payload not in actions:
+            log.warning("Unknown command: %s", payload)
+            return
+        self._go_offline()
+        wait = "0" if payload == "sleep" else delay
+        # Cancel a pending shut down/restart with: pkill -f "systemctl poweroff|systemctl reboot"
+        subprocess.Popen(["sh", "-c", f"sleep {int(wait)}; systemctl {actions[payload]}"],
+                         start_new_session=True)
 
     # ---- MQTT ------------------------------------------------------------ #
     def _publish_discovery(self, client):
@@ -436,7 +711,7 @@ class Agent:
 def get_password(cfg):
     """Password from Windows Credential Manager; config.ini only as a fallback."""
     plain = cfg.get("mqtt", "password")
-    if plain:
+    if plain or not IS_WINDOWS:
         return plain
     user = cfg.get("mqtt", "username")
     try:
@@ -459,6 +734,9 @@ def get_password(cfg):
 def migrate_password(cfg, config_path: Path):
     """Is the password still readable in config.ini? Move it to Credential Manager."""
     plain = cfg.get("mqtt", "password")
+    if not IS_WINDOWS:
+        # Linux: the password stays in config.ini, readable only by you (chmod 600).
+        return
     if not plain or not config_path.exists():
         return
     user = cfg.get("mqtt", "username")

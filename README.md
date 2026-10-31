@@ -1,8 +1,10 @@
 # Desktop MQTT Agent
 
-A small Python agent that publishes the status of a Windows PC to [Home Assistant](https://www.home-assistant.io/) over MQTT. Through MQTT discovery, everything shows up automatically as one device, with no custom integration needed.
+A small Python agent that publishes the status of a Windows or Linux PC to [Home Assistant](https://www.home-assistant.io/) over MQTT. Through MQTT discovery, everything shows up automatically as one device, with no custom integration needed.
 
-It is meant to be light and easy to read: one Python file, one config file, one installer.
+It is meant to be light and easy to read: one Python file, one config file, and an installer per operating system.
+
+**Supported:** Windows 10/11, and Linux with systemd, tested on Bazzite (Fedora Atomic) with KDE Plasma 6 on Wayland.
 
 ## Use cases
 
@@ -14,21 +16,21 @@ The agent turns your PC into presence and control signals for Home Assistant aut
 - **Bedtime and night routines.** Put PCs that have been idle for a while to sleep when the house goes into night mode, or get a notification when one is still being used.
 - **Wake and power control.** Combine with Home Assistant's Wake-on-LAN integration and an NFC tag or button: one scan turns the PC on, and the same tag shuts it down when it's running.
 - **Focus and gaming scenes.** Use *Active app* to switch the room to a gaming or movie scene when a specific program is in the foreground, and back when you're done.
-- **Maintenance alerts.** Get notified when drive C: is almost full, or, with LibreHardwareMonitor, when the CPU or GPU stays hot for too long.
+- **Maintenance alerts.** Get notified when the system drive is almost full, or when the CPU or GPU stays hot for too long (built in on Linux, through LibreHardwareMonitor on Windows).
 - **Dashboards.** Show at a glance which PCs are on, locked or in use, with lock and power buttons right on the dashboard.
 
 ## What you get
 
 | Entity | What it shows |
 | --- | --- |
-| CPU usage, Memory usage, Disk C: usage | percentages |
+| CPU usage, Memory usage, Disk usage | percentages (drive C: on Windows, `/var/home` on Linux) |
 | Idle | seconds since the last mouse or keyboard input |
 | Last boot | time of the last start-up |
-| Active app | process name of the foreground window (e.g. `chrome.exe`), never the window title |
+| Active app | process name of the foreground window (e.g. `chrome.exe`), never the window title. Windows only |
 | Locked | on while the lock screen is shown |
 | In use | on when the PC was used in the last 5 minutes and is not locked |
 | Lock, Sleep, Shut down, Restart | buttons |
-| CPU/GPU temperature, GPU usage | optional, through LibreHardwareMonitor |
+| CPU/GPU temperature, GPU usage | built in on Linux; optional on Windows, through LibreHardwareMonitor |
 
 When the PC is off, asleep, or nobody is logged on, all entities become **unavailable**. With the sleep and shut down buttons this happens right away; otherwise within about 45 seconds.
 
@@ -36,11 +38,11 @@ Entity names are available in English and Dutch (`language = en` or `nl` in `con
 
 ## Requirements
 
-- Windows 10 or 11
+- Windows 10 or 11, or Linux (see [Linux](#linux-bazzite-fedora-and-other-systemd-distros))
 - [Python 3](https://www.python.org/downloads/windows/) (tick **Add python.exe to PATH** during installation)
 - An MQTT broker that Home Assistant uses, for example the **Mosquitto broker** app in Home Assistant, with the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) set up
 
-## Installation
+## Installation (Windows)
 
 1. **Create an MQTT user.** With the Mosquitto broker app, any Home Assistant user can log in to the broker. Go to **Settings → People → Users → Add user**, for example `pc-agent`, with *Can only log in from the local network* on and no administrator rights.
 2. **Put the files in a fixed place**, for example `C:\Tools\desktop-mqtt-agent`. The agent runs from that folder.
@@ -67,9 +69,34 @@ This prints the discovery message and one reading without connecting. To run it 
 python desktop_mqtt_agent.py
 ```
 
-## Temperatures (optional)
+## Linux (Bazzite, Fedora and other systemd distros)
 
-Windows does not report temperatures itself. For that you need LibreHardwareMonitor.
+The agent also runs on Linux, tested on Bazzite with KDE Plasma (Wayland). No sudo needed.
+
+```bash
+git clone https://github.com/Vstromnerd/desktop-mqtt-agent
+cd desktop-mqtt-agent
+bash install-linux.sh
+```
+
+The installer puts the agent in `~/.local/share/desktop-mqtt-agent` with its own Python environment, asks for the MQTT settings, runs it as a systemd user service that starts at every login, and offers to turn on Wake-on-LAN for the wired connection.
+
+Differences from Windows:
+
+- **Temperatures and GPU usage** come straight from the kernel (`k10temp`, `amdgpu`), no extra tool needed.
+- **Active app** stays empty: Wayland doesn't let one app see another app's windows.
+- **Disk usage** is that of `/var/home` (on Atomic distros `/` is a read-only image).
+- **Password** stays in `config.ini`, which only you can read (`chmod 600`). A locked KDE Wallet at login would otherwise stop the agent from connecting.
+- **Locked** comes from systemd-logind. **Idle** comes from the Wayland `ext-idle-notify` protocol (supported by KDE Plasma's KWin and most other compositors), spoken directly over the Wayland socket, so no extra package is needed. Older desktops fall back to `org.freedesktop.ScreenSaver` or logind's idle hint.
+- **Lock, sleep, shut down and restart** go through `loginctl` and `systemctl`, which the logged-in user may use without sudo.
+
+**Moving a PC from Windows to Linux without new entities:** enter the old device ID when the installer asks for it. That's the part before `_cpu` in the unique ID of the old CPU sensor (Settings → Entities → the sensor → cog → *Unique ID*). The entity IDs, automations and dashboards then stay the same.
+
+Useful commands: `systemctl --user status desktop-mqtt-agent`, `journalctl --user -u desktop-mqtt-agent -f`, and `bash install-linux.sh --uninstall` to remove it.
+
+## Temperatures on Windows (optional)
+
+Windows does not report temperatures itself (Linux does, see above). For that you need LibreHardwareMonitor.
 
 1. Install and start [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor).
 2. Turn on **Options → Remote Web Server → Run** (port 8085).
@@ -80,13 +107,14 @@ The default sensor paths match an AMD Ryzen CPU (`Core (Tctl/Tdie)`). If LibreHa
 ## Security
 
 - **Anyone who can publish to your MQTT broker can lock, sleep, shut down or restart the PC** through the command topic. Use a broker with authentication, and set `allow_power_commands = false` if you don't want the power buttons. Locking always stays available.
-- The MQTT password is kept in Windows Credential Manager. If you type it in `config.ini` by hand, the agent moves it there on first start and clears the line.
+- **Windows:** the MQTT password is kept in Windows Credential Manager. If you type it in `config.ini` by hand, the agent moves it there on first start and clears the line.
+- **Linux:** the password stays in `config.ini`, which the installer makes readable only by you.
 - The agent sends only the process name of the active app, never window titles.
 
 ## Good to know
 
 - **Sleep:** with hibernation enabled, the sleep button makes Windows hibernate instead. Turn hibernation off with `powercfg /hibernate off` (as administrator).
-- **Problems:** see `desktop_mqtt_agent.log` in the same folder.
+- **Problems:** see `desktop_mqtt_agent.log` in the agent's folder (on Linux `~/.local/share/desktop-mqtt-agent`).
 - **Upgrading from "HA PC Agent":** run `INSTALL.bat` again. It removes the old scheduled task, and the agent takes over the stored password. Entity IDs and the Home Assistant device stay the same. Add `language = nl` to `config.ini` to keep the Dutch entity names.
 
 ## MQTT topics
